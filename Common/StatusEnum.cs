@@ -3,7 +3,7 @@
 #define public
 #endif
 
-namespace RecordPlaybackDLLEnums
+namespace InjectAndCaptureDllEnums
 {
     public enum StatusCode
     {

@@ -1,70 +1,98 @@
 ﻿using System;
+using System.Collections.Generic;
 using System.Collections.ObjectModel;
 using System.Linq;
+using System.Runtime.InteropServices;
 using System.Text.RegularExpressions;
 using System.Windows;
-using System.Windows.Controls;
+using System.Windows.Data;
 using System.Windows.Input;
-using MacroRecorderGUI.ViewModels;
-using ProtobufGenerated;
+using Google.Protobuf;
+using InjectAndCaptureDllEnums;
 
 namespace MacroRecorderGUI
 {
     public partial class MainWindow : Window
     {
+        // ReSharper disable once PrivateFieldCanBeConvertedToLocalVariable
+        private readonly InjectAndCaptureDll.CaptureEventCallback _captureEventCallbackDelegate;
+        // ReSharper disable once PrivateFieldCanBeConvertedToLocalVariable
+        private readonly InjectAndCaptureDll.StatusCallback _statusCallbackDelegate;
+
+        private readonly Macro _currentMacro = new Macro();
+
+        //public ObservableCollection<ProtobufGenerated.InputEvent> Events = new ObservableCollection<ProtobufGenerated.InputEvent>();
+
+        private MainWindowModel model = MainWindowModel.Instance;
+
+        private void CaptureEventCb(IntPtr evtBufPtr, int bufSize)
+        {
+            var evtBuf = new byte[bufSize];
+            Marshal.Copy(evtBufPtr, evtBuf, 0, bufSize);
+            var parsedEvent = ProtobufGenerated.InputEvent.Parser.ParseFrom(evtBuf);
+
+            Dispatcher.Invoke(()=> _currentMacro.Events.Add(parsedEvent));
+        }
+
+        private void StatusCb(InjectAndCaptureDllEnums.StatusCode statusCode)
+        {
+            if (statusCode == StatusCode.PlaybackFinished)
+            {
+                //TODO: publish an event here?
+                Dispatcher.Invoke(() =>
+                {
+                    if (LoopIndefinitely.IsChecked == true) PlayEvents_Click(null, null);
+                });
+            }
+            else
+            {
+                MessageBox.Show("Status reported: \"" + statusCode + "\".");
+            }
+        }
+
         public MainWindow()
         {
             InitializeComponent();
+            _statusCallbackDelegate = StatusCb;
+            _captureEventCallbackDelegate = CaptureEventCb;
+            EventsListBox.ItemsSource = _currentMacro.Events;
+            InjectAndCaptureDll.Init(_captureEventCallbackDelegate, _statusCallbackDelegate);
         }
 
         private void StartRecord_Click(object sender, RoutedEventArgs e)
         {
-            if (ClearListOnStartRecord.IsChecked == true) ClearList_Click(sender, e);
-            RecordPlaybackDll.StartRecord();
+            InjectAndCaptureDll.StartCapture();
         }
 
         private void StopRecord_Click(object sender, RoutedEventArgs e)
         {
-            RecordPlaybackDll.StopRecord();
-            if (AutoChangeDelay.IsChecked == true) ChangeDelays_Click(sender, e);
+            InjectAndCaptureDll.StopCapture();
         }
 
         private void PlayEvents_Click(object sender, RoutedEventArgs e)
         {
-            (DataContext as MainWindowViewModel)?.ActiveMacro?.PlayMacro();
-        }
+            if (!_currentMacro.Events.Any()) return;
 
-        private void Selector_OnSelectionChanged(object sender, SelectionChangedEventArgs e)
-        {
-            //TODO: the need to handle this manually disgusts me, however there's no native way in wpf to bind to SelectedItems. another possible WA:
-            // when Events will be wrapped in a presentable class, it can have a "isSelected" property which is bound per item in the list
-            // (not sure about the overhead of such a mass binding)
-            foreach (ProtobufGenerated.InputEvent addedItem in e.AddedItems)
-            {
-                ((sender as ListBox)?.DataContext as MacroViewModel)?.SelectedEvents.Add(addedItem);
-            }
-            foreach (ProtobufGenerated.InputEvent removedItem in e.RemovedItems)
-            {
-                ((sender as ListBox)?.DataContext as MacroViewModel)?.SelectedEvents.Remove(removedItem);
-            }
-        }
+            var eventsCollClone = new ObservableCollection<ProtobufGenerated.InputEvent>(_currentMacro.Events);
+            model.InsertReleasedHotkeysAtStart(eventsCollClone);
+            model.InsertReleasedHotkeysAtEnd(eventsCollClone);
 
+            var serializedEventsByteArray = Macro.SerializeEventsToByteArray(eventsCollClone);
+            InjectAndCaptureDll.InjectEvents(serializedEventsByteArray);
+        }
+        
         private void RemoveEvent_Click(object sender, RoutedEventArgs e)
         {
-            (DataContext as MainWindowViewModel)?.ActiveMacro?.RemoveSelectedEvents();
-        }
-
-        private void EventsListBox_OnKeyDown(object sender, KeyEventArgs e)
-        {
-            if (e.Key == Key.Delete)
+            var selectedItems = EventsListBox.SelectedItems.Cast<ProtobufGenerated.InputEvent>().ToList();
+            foreach (var eventToRemove in selectedItems)
             {
-                RemoveEvent_Click(sender, e);
+                _currentMacro.Events.Remove(eventToRemove);
             }
         }
 
         private void ClearList_Click(object sender, RoutedEventArgs e)
         {
-            (DataContext as MainWindowViewModel)?.ActiveMacro?.Clear();
+            _currentMacro.Events.Clear();
         }
 
         private void AllowOnlyNumbersInTextBox(object sender, TextCompositionEventArgs e)
@@ -76,28 +104,52 @@ namespace MacroRecorderGUI
         private void ChangeDelays_Click(object sender, RoutedEventArgs e)
         {
             if (!DelayTextBox.Text.Any()) return;
+
             var timeIncrement = Convert.ToUInt64(DelayTextBox.Text);
-            (DataContext as MainWindowViewModel)?.ActiveMacro?.ChangeDelays(timeIncrement);
+            var currentTimeOffset = 0ul;
+            foreach(var inputEvent in _currentMacro.Events)
+            {
+                inputEvent.TimeSinceStartOfRecording = currentTimeOffset;
+                currentTimeOffset += timeIncrement;
+            }
+            CollectionViewSource.GetDefaultView(_currentMacro.Events).Refresh(); //TODO: implement the events as wrapper class around protobuf class, and implement PropertyChanged event listeners on them
         }
-        
+
+        private void EventsListBox_OnKeyDown(object sender, KeyEventArgs e)
+        {
+            if (e.Key == Key.Delete)
+            {
+                RemoveEvent_Click(sender, e);
+            }
+        }
+
         private void SaveEvents_Click(object sender, RoutedEventArgs e)
         {
-            (DataContext as MainWindowViewModel)?.ActiveMacro?.SaveToFile(); //TODO: inject "filesaver" or whatever
+            FileOperations.SaveEventsToFile(_currentMacro.Events);
         }
 
         private void LoadEvents_Click(object sender, RoutedEventArgs e)
         {
-            (DataContext as MainWindowViewModel)?.ActiveMacro?.LoadFromFile(); //TODO: inject "fileloader" or whatever
+            var deserializedEvents = FileOperations.LoadEventsFromFile();
+            if (deserializedEvents != null)
+            {
+                PopulateEventCollectionWithNewEvents(deserializedEvents);
+            }
+        }
+
+        private void PopulateEventCollectionWithNewEvents(IEnumerable<ProtobufGenerated.InputEvent> deserializedEvents)
+        {
+            _currentMacro.Events.Clear();
+            foreach (var deserializedEvent in deserializedEvents)
+            {
+                _currentMacro.Events.Add(deserializedEvent);
+            }
         }
 
         private void AbortPlayback_Click(object sender, RoutedEventArgs e)
         {
-            RecordPlaybackDll.PlaybackEventAbort();
+            InjectAndCaptureDll.InjectEventAbort();
         }
 
-        private void AddTab_Click(object sender, RoutedEventArgs e)
-        {
-            (DataContext as MainWindowViewModel)?.AddNewTab();
-        }
     }
 }
